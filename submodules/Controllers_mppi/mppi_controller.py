@@ -247,3 +247,193 @@ def _compute_weights(costs: jax.Array, lambda_: float) -> jax.Array:
     min_cost = jnp.min(costs)
     scaled = -(costs - min_cost) / lambda_
     return jax.nn.softmax(scaled)
+#initialisiere
+
+def create(
+    nx: int,
+    nu: int,
+    noise_sigma: jax.Array,
+    num_samples: int = 100,
+    horizon: int = 15,
+    lambda_: float = 1.0,
+    noise_mu: Optional[jax.Array] = None,
+    u_min: Optional[jax.Array] = None,
+    u_max: Optional[jax.Array] = None,
+    u_init: Optional[jax.Array] = None,
+    U_init: Optional[jax.Array] = None,
+    u_scale: float = 1.0,
+    u_per_command: int = 1,
+    step_dependent_dynamics: bool = False,
+    rollout_samples: int = 1,
+    rollout_var_cost: float = 0.0,
+    rollout_var_discount: float = 0.95,
+    sample_null_action: bool = False,
+    noise_abs_cost: bool = False,
+    key: Optional[jax.Array] = None,
+) -> Tuple[MPPIConfig, MPPIState]:
+    """Factory: create config + initial state."""
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    config = MPPIConfig(
+        num_samples=num_samples,
+        horizon=horizon,
+        nx=nx,
+        nu=nu,
+        lambda_=lambda_,
+        u_scale=u_scale,
+        u_per_command=u_per_command,
+        step_dependent_dynamics=step_dependent_dynamics,
+        rollout_samples=rollout_samples,
+        rollout_var_cost=rollout_var_cost,
+        rollout_var_discount=rollout_var_discount,
+        sample_null_action=sample_null_action,
+        noise_abs_cost=noise_abs_cost,
+    )
+
+    # Initialize state variables
+    if noise_mu is None:
+        noise_mu = jnp.zeros(nu)
+
+    # Ensure noise_sigma is 2D
+    if noise_sigma.ndim == 1:
+        noise_sigma = jnp.diag(noise_sigma)
+
+    noise_sigma_inv = jnp.linalg.inv(noise_sigma)
+
+    if u_init is None:
+        u_init = jnp.zeros(nu)
+
+    if U_init is None:
+        U_init = jnp.tile(u_init, (horizon, 1))
+
+    mppi_state = MPPIState(
+        U=U_init,
+        u_init=u_init,
+        noise_mu=noise_mu,
+        noise_sigma=noise_sigma,
+        noise_sigma_inv=noise_sigma_inv,
+        u_min=None if u_min is None else jnp.array(u_min),
+        u_max=None if u_max is None else jnp.array(u_max),
+        key=key,
+    )
+
+    return config, mppi_state
+
+
+def command(
+    config: MPPIConfig,
+    mppi_state: MPPIState,
+    current_obs: jax.Array,
+    dynamics: DynamicsFn,
+    running_cost: RunningCostFn,
+    terminal_cost: Optional[TerminalCostFn] = None,
+    shift: bool = True,
+) -> Tuple[jax.Array, MPPIState]:
+    """Compute optimal action and return updated state."""
+    noise, key = _sample_noise(
+        mppi_state.key,
+        config.num_samples,
+        config.horizon,
+        mppi_state.noise_mu,
+        mppi_state.noise_sigma,
+        config.sample_null_action,
+    )
+
+    perturbed_actions = mppi_state.U[None, :, :] + noise
+    scaled_actions = perturbed_actions * config.u_scale
+    scaled_actions = _bound_action(
+        scaled_actions, mppi_state.u_min, mppi_state.u_max
+    )
+
+    rollout_costs = _compute_rollout_costs(
+        config,
+        current_obs,
+        scaled_actions,
+        dynamics,
+        running_cost,
+        terminal_cost,
+    )
+    noise_costs = _compute_noise_cost(
+        noise, mppi_state.noise_sigma_inv, config.noise_abs_cost
+    )
+    total_costs = rollout_costs + noise_costs
+
+    weights = _compute_weights(total_costs, config.lambda_)
+    delta_U = jnp.tensordot(weights, noise, axes=1)
+    U_new = mppi_state.U + delta_U
+
+    u_min_scaled, u_max_scaled = _scaled_bounds(
+        mppi_state.u_min, mppi_state.u_max, config.u_scale
+    )
+    U_new = _bound_action(U_new, u_min_scaled, u_max_scaled)
+
+    action_seq = U_new[: config.u_per_command]
+    scaled_action_seq = _bound_action(
+        action_seq * config.u_scale, mppi_state.u_min, mppi_state.u_max
+    )
+    action = (
+        scaled_action_seq[0] if config.u_per_command == 1 else scaled_action_seq
+    )
+
+    new_state = replace(mppi_state, U=U_new, key=key)
+    if shift:
+        new_state = _shift_nominal(new_state, config.u_per_command)
+
+    return action, new_state
+def reset(
+    config: MPPIConfig, mppi_state: MPPIState, key: jax.Array
+) -> MPPIState:
+    """Reset nominal trajectory."""
+    U_new = jnp.tile(mppi_state.u_init, (config.horizon, 1))
+    return replace(mppi_state, U=U_new, key=key)
+
+
+def get_rollouts(
+    config: MPPIConfig,
+    mppi_state: MPPIState,
+    current_obs: jax.Array,
+    dynamics: DynamicsFn,
+    num_rollouts: int = 1,
+) -> jax.Array:
+    """Forward-simulate trajectories for visualization."""
+    noise, key = _sample_noise(
+        mppi_state.key,
+        num_rollouts,
+        config.horizon,
+        mppi_state.noise_mu,
+        mppi_state.noise_sigma,
+        sample_null_action=False,
+    )
+    perturbed_actions = mppi_state.U[None, :, :] + noise
+    scaled_actions = perturbed_actions * config.u_scale
+    scaled_actions = _bound_action(
+        scaled_actions, mppi_state.u_min, mppi_state.u_max
+    )
+
+    def rollout_single(actions, obs):
+        def step_fn(state, inputs):
+            t, action = inputs
+            next_state = _call_dynamics(
+                dynamics, state, action, t, config.step_dependent_dynamics
+            )
+            return next_state, _state_for_cost(next_state, config.nx)
+
+        ts = jnp.arange(config.horizon)
+        init_state = obs
+        _, states = jax.lax.scan(step_fn, init_state, (ts, actions))
+        init_out = _state_for_cost(init_state, config.nx)
+        return jnp.concatenate([init_out[None, :], states], axis=0)
+
+    if current_obs.ndim == 1:
+        rollouts = jax.vmap(lambda a: rollout_single(a, current_obs))(
+            scaled_actions
+        )
+    else:
+        rollouts = jax.vmap(
+            lambda obs: jax.vmap(lambda a: rollout_single(a, obs))(
+                scaled_actions
+            )
+        )(current_obs)
+
+    return rollouts
