@@ -340,7 +340,7 @@ def command(
         config.sample_null_action,
     )
 
-    perturbed_actions = mppi_state.U[None, :, :] + noise
+    perturbed_actions = mppi_state.U[None, :, :] + noise #v = u + e
     scaled_actions = perturbed_actions * config.u_scale
     scaled_actions = _bound_action(
         scaled_actions, mppi_state.u_min, mppi_state.u_max
@@ -381,6 +381,7 @@ def command(
         new_state = _shift_nominal(new_state, config.u_per_command)
 
     return action, new_state
+
 def reset(
     config: MPPIConfig, mppi_state: MPPIState, key: jax.Array
 ) -> MPPIState:
