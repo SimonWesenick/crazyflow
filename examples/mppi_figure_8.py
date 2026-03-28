@@ -3,27 +3,46 @@ import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from PIL import Image
 
 from crazyflow.control.control import Control
 from crazyflow.sim import Sim
 from crazyflow.sim.physics import Physics
+from crazyflow.sim.visualize import draw_line, draw_points
 from crazyflow.utils import enable_cache
 
 from submodules.Controllers_mppi import mppi_controller as mppi
 
 
 DT = 0.1
-HORIZON = 20
+HORIZON = 30
+TRAJECTORY_TIME = 10.0  #sekunden um fig 8 zu matchen 
+OMEGA = 2 * jnp.pi / TRAJECTORY_TIME  # angular frequency dass eine runde TRAJECTORY_TIME dauert
+
+RECORD_VIDEO = True   # Set to False for live interactive window instead
+VIDEO_WIDTH = 1280
+VIDEO_HEIGHT = 720
+# Figure-8 is in the XZ plane (y=0), centered at [0,0,1].
+# azimuth=90 looks from +Y so the full 8 shape is visible face-on.
+CAM_CONFIG = {
+    "lookat": np.array([0.0, 0.0, 1.0]),
+    "distance": 2.0,
+    "azimuth": 90.0,
+    "elevation": -15.0,
+}
 
 
 def figure8_reference(t: float):
-    px = jnp.sin(t)
+   
+    phase = OMEGA * t
+    px = jnp.sin(phase)
     py = 0.0
-    pz = 0.5 * jnp.sin(2.0 * t) + 1.0
+    pz = 0.5 * jnp.sin(2.0 * phase) + 1.0
 
-    vx = jnp.cos(t)
+    # vel
+    vx = OMEGA * jnp.cos(phase)
     vy = 0.0
-    vz = jnp.cos(2.0 * t)
+    vz = OMEGA * jnp.cos(2.0 * phase)
 
     pos_ref = jnp.array([px, py, pz])
     vel_ref = jnp.array([vx, vy, vz])
@@ -94,12 +113,12 @@ def build_mppi():
     config, state = mppi.create(
         nx=6,
         nu=6,
-        noise_sigma=jnp.eye(6) * 0.05,
-        num_samples=800,
+        num_samples=1500,
         horizon=HORIZON,
         lambda_=1.0,
-        u_min=jnp.array([-0.05, -0.05, -0.05, -0.1, -0.1, -0.1]),
-        u_max=jnp.array([0.05, 0.05, 0.05, 0.1, 0.1, 0.1]),
+        noise_sigma=jnp.eye(6) * 0.02,
+        u_min=jnp.array([-0.02, -0.02, -0.02, -0.05, -0.05, -0.05]),
+        u_max=jnp.array([ 0.02,  0.02,  0.02,  0.05,  0.05,  0.05]),
         step_dependent_dynamics=True,
     )
     return config, state
@@ -148,12 +167,19 @@ def main():
     config, mppi_state = build_mppi()
     print("MPPI created")
 
+    # Precompute the full figure-8 reference trajectory for visualization (200 points = 1 lap)
+    ref_t = np.linspace(0, TRAJECTORY_TIME, 200)
+    full_ref_traj = np.array([np.array(figure8_reference(t)[0]) for t in ref_t])
+
     states = []
     cmds = []
     ref_positions = []
+    frames = []
+
+    render_mode = "rgb_array" if RECORD_VIDEO else "human"
 
     print("Before first step")
-    for k in range(200):
+    for k in range(100):
         current_obs = get_mppi_state_from_sim(sim)
 
         running_cost_k = make_running_cost(k)
@@ -170,14 +196,28 @@ def main():
 
         state_cmd = build_state_command(k, action)
 
-        # shape: (n_worlds, n_drones, 13)
+        # (n_worlds, n_drones, 13)
         sim.state_control(state_cmd[None, None, :])
 
         # mehrere Substeps pro MPC-Schritt
-        sim.step(n_steps=10)
+        sim.step(n_steps=50)  # 50 substeps at 500 Hz = 0.1s = DT
 
         try:
-            sim.render()
+            # Full reference trajectory in gray
+            draw_line(sim, full_ref_traj, rgba=np.array([0.6, 0.6, 0.6, 0.8]))
+            # MPPI planned nominal rollout in green: roll out mppi_state.U from current state
+            rollout_state = current_obs
+            rollout_pts = [np.array(current_obs[:3])]
+            for t, u in enumerate(mppi_state.U):
+                rollout_state = dynamics(rollout_state, u, t)
+                rollout_pts.append(np.array(rollout_state[:3]))
+            draw_line(sim, np.array(rollout_pts), rgba=np.array([0.0, 1.0, 0.0, 1.0]))
+            # Current reference target as a red sphere
+            #current_ref = np.array(figure8_reference(k * DT)[0])[None, :]
+            #draw_points(sim, current_ref, rgba=np.array([1.0, 0.0, 0.0, 1.0]), size=0.05)
+            frame = sim.render(mode=render_mode, width=VIDEO_WIDTH, height=VIDEO_HEIGHT, cam_config=CAM_CONFIG)
+            if RECORD_VIDEO and frame is not None:
+                frames.append(frame)
         except Exception:
             pass
 
@@ -199,6 +239,18 @@ def main():
     print(states[-5:, :3])
 
     Path("figures").mkdir(parents=True, exist_ok=True)
+
+    if RECORD_VIDEO and frames:
+        gif_path = "figures/mppi_figure8.gif"
+        pil_frames = [Image.fromarray(f) for f in frames]
+        pil_frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=pil_frames[1:],
+            duration=int(DT * 1000),  # ms per frame → real-time playback
+            loop=0,
+        )
+        print(f"Video saved to {gif_path}")
 
     trajectory = np.column_stack([
         np.arange(states.shape[0]) * DT,
