@@ -27,8 +27,8 @@ def terimnal_cost(state, action):
     pos = jnp.array([px, py])
     vel = jnp.array([vx, vy])
 
-    pos_terminal = 50.0 * jnp.sum((pos-GOAL)**2)
-    vel_terminal = 20.0 *jnp.sum(vel**2)
+    pos_terminal = 70 * jnp.sum((pos-GOAL)**2)
+    vel_terminal = 30 *jnp.sum(vel**2)
 
     return pos_terminal + vel_terminal
 def running_cost(state, action):
@@ -48,9 +48,9 @@ def main():
         nx=4,
         nu=2,
         noise_sigma=jnp.eye(2) * 0.3,
-        num_samples=500,
+        num_samples=2000,
         horizon=25,
-        lambda_=1,
+        lambda_=0.9,
         u_min=jnp.array([-1.0, -1.0]),
         u_max=jnp.array([1.0, 1.0]),
     )
@@ -87,15 +87,31 @@ def main():
     print("Final state:", states[-1])
     print("Final position:", states[-1, :2])
 
-    plt.figure(figsize=(6, 6))
-    plt.plot(states[:, 0], states[:, 1], marker="o", markersize=3)
-    plt.scatter(GOAL[0], GOAL[1], marker="x", s=100, label="goal")
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.title("MPPI Point Mass Trajectory")
-    plt.axis("equal")
-    plt.legend()
-    plt.grid(True)
+    time = jnp.arange(len(states)) * DT
+    speed = jnp.sqrt(states[:, 2] ** 2 + states[:, 3] ** 2)
+
+    fig, (ax_traj, ax_vel) = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax_traj.plot(states[:, 0], states[:, 1], marker="o", markersize=3, label="trajectory")
+    ax_traj.scatter(GOAL[0], GOAL[1], marker="x", s=100, color="red", label="goal")
+    ax_traj.set_xlabel("x")
+    ax_traj.set_ylabel("y")
+    ax_traj.set_title("MPPI Point Mass Trajectory")
+    ax_traj.axis("equal")
+    ax_traj.legend()
+    ax_traj.grid(True)
+
+    ax_vel.plot(time, states[:, 2], label="vx")
+    ax_vel.plot(time, states[:, 3], label="vy")
+    ax_vel.plot(time, speed, label="|v|", linestyle="--", color="black")
+    ax_vel.axhline(0, color="gray", linewidth=0.8)
+    ax_vel.set_xlabel("time [s]")
+    ax_vel.set_ylabel("velocity [m/s]")
+    ax_vel.set_title("Velocity over Time")
+    ax_vel.legend()
+    ax_vel.grid(True)
+
+    fig.tight_layout()
 
     Path("figures").mkdir(parents=True, exist_ok=True)
     plt.savefig("figures/mppi_pointmass_trajectory.png", dpi=200, bbox_inches="tight")
